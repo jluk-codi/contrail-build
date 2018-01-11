@@ -68,6 +68,7 @@ def GetTestEnvironment(test):
     return env
 
 def RunUnitTest(env, target, source, timeout = 300):
+    print("RunUnitTest(target=%s, source=%s" % (str(source[0].abspath),str(target[0].abspath)))
     if env['ENV'].has_key('BUILD_ONLY'):
         return
     import subprocess
@@ -146,11 +147,44 @@ def TestSuite(env, target, source):
         for test in env.Flatten(source):
             # UnitTest() may have tagged tests with skip_run attribute
             if getattr( test.attributes, 'skip_run', False ): continue
-            log = test.abspath + '.log'
-            cmd = env.Command(log, test, RunUnitTest)
-            env.AlwaysBuild(cmd)
-            env.Alias(target, cmd)
+            if env['ENV'].has_key('BUILD_ONLY'):
+                # env.AlwaysBuild(test)
+                env.Alias(target, test)
+            else:
+                log = test.abspath + '.log'
+                cmd = env.Command(log, test, RunUnitTest)
+                env.AlwaysBuild(cmd)
+                env.Alias(target, cmd)
         return target
+
+# Maybe add add'l_targets parm?
+def SetupPyTestSuite(env, sdist_target, sdist_depends):
+    buildspace_link = os.environ.get('CONTRAIL_REPO')
+    if buildspace_link:
+        # in CI environment shebang limit exceeds for python
+        # in easy_install/pip, reach to it via symlink
+        top_dir = env.Dir(buildspace_link + '/' + Dir('.').path)
+    else:
+        top_dir = env.Dir('.')
+
+    cmd_base = 'bash -c "set -o pipefail && cd ' + env.Dir(top_dir).path + ' && python setup.py %s 2>&1 | tee %s.log"'
+    if env['ENV'].has_key('BUILD_ONLY'):
+        cmd = 'bdist'
+    else:
+        cmd = 'run_tests'
+
+    test_cmd = env.Command('test.log', sdist_target, cmd_base % (cmd, "test"))
+    cov_cmd = env.Command('coveragetest.log', sdist_target, cmd_base % (cmd + ' --coverage', 'coveragetest'))
+
+    env.Depends(test_cmd, [env['TOP']+x for x in sdist_depends])
+    env.Depends(cov_cmd, [env['TOP']+x for x in sdist_depends])
+
+    d = env.Dir('.').srcnode().path
+    print("Setting up aliases for %s :test and :coverage" % d)
+    env.Alias( d + ':test', test_cmd )
+    env.Alias( d + ':coverage', cov_cmd )
+    #env.Depends('test', test_cmd)
+    env.Depends('coverage', cov_cmd)
 
 def setup_venv(env, target, venv_name, path=None):
     p = path
@@ -251,9 +285,14 @@ def UnitTest(env, name, sources, **kwargs):
 # XXX: This should be rewritten using SCons Value nodes (for generating
 # build info itself) and Builder for managing targets.
 def GenerateBuildInfoCode(env, target, source, path):
-    env.AlwaysBuild(
-        env.Command(target=target, source=[], action=BuildInfoAction)
-    )
+    o = env.Command(target=target, source=[], action=BuildInfoAction)
+
+    # if we are running under CI or jenkins-driven CB/OB build,
+    # we do NOT want to use AlwaysBuild, as it triggers unnecessary
+    # rebuilds.
+    if not (os.environ.get('ZUUL_CHANGE') or os.environ.get('BUILD_BRANCH')):
+        env.AlwaysBuild(o)
+    
     return
 
 # If contrail-controller (i.e., #controller/) is present, determine
@@ -1111,6 +1150,12 @@ def SetupBuildEnvironment(conf):
     env['INSTALL_SNMP_CONF'] += '/etc/snmp'
     env['INSTALL_EXAMPLE'] += '/usr/share/contrail'
     env['INSTALL_DOC'] += '/usr/share/doc'
+    env['CCCOMSTR'] = 'CC $TARGET'
+    env['CXXCOMSTR'] = 'C++ $TARGET'
+    env['LINKCOMSTR'] = 'LD $TARGET'
+    env['SHCCCOMSTR'] = 'CC $TARGET [shared]'
+    env['SHCXXCOMSTR'] = 'C++ $TARGET [shared]'
+    env['SHDLINKCOMSTR'] = 'LD $TARGET [shared]'
 
     distribution = env.GetPlatformInfo()[0]
 
@@ -1215,6 +1260,7 @@ def SetupBuildEnvironment(conf):
             env.Append(CCFLAGS = '-g')
             env.Append(LINKFLAGS = '-g')
 
+    env.Append(BUILDERS = {'SetupPyTestSuite': SetupPyTestSuite })
     env.Append(BUILDERS = {'PyTestSuite': PyTestSuite })
     env.Append(BUILDERS = {'TestSuite': TestSuite })
     env.Append(BUILDERS = {'UnitTest': UnitTest})
